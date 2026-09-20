@@ -1,10 +1,11 @@
-# Home SOC Lab — Despliegue de Wazuh y detección de autenticaciones fallidas
+# Home SOC Lab — Despliegue de Wazuh, detección de fuerza bruta y verificación del control
 
-> Laboratorio doméstico de operaciones de seguridad: despliegue de un SIEM real (Wazuh), monitorización de un endpoint Windows y detección, triaje e investigación de un ataque de fuerza bruta contra credenciales.
+> Laboratorio doméstico de operaciones de seguridad: despliegue de un SIEM real (Wazuh), monitorización de un endpoint Windows, detección y triaje de un ataque de fuerza bruta, y remediación verificada del control preventivo que lo permitió.
 
 *Home SOC lab: Wazuh SIEM deployed on Ubuntu Server, monitoring a Windows 10 endpoint via the
 Wazuh agent. Covers detection, triage and MITRE ATT&CK mapping of a brute force authentication
-attack, plus a CIS benchmark configuration assessment of the endpoint.*
+attack, a CIS benchmark configuration assessment, and a measured remediation phase with
+before/after evidence.*
 
 ---
 
@@ -17,6 +18,7 @@ attack, plus a CIS benchmark configuration assessment of the endpoint.*
 - [Enrolado del agente Windows](#enrolado-del-agente-windows)
 - [Caso práctico: detección de fuerza bruta](#caso-práctico-detección-de-fuerza-bruta)
 - [Hallazgos adicionales](#hallazgos-adicionales)
+- [Fase 2: remediación y verificación](#fase-2-remediación-y-verificación)
 - [Problemas encontrados](#problemas-encontrados)
 - [Conclusiones](#conclusiones)
 - [Evolución del laboratorio](#evolución-del-laboratorio)
@@ -31,6 +33,8 @@ Montar desde cero un entorno de monitorización de seguridad equivalente al que 
 - Desplegar y configurar un SIEM real, no un entorno simulado ni una plataforma de formación.
 - Monitorizar un endpoint Windows mediante agente y verificar la recolección de eventos.
 - Generar actividad maliciosa de forma controlada, detectarla, y completar el ciclo de triaje: análisis, clasificación MITRE ATT&CK y propuesta de mitigación.
+
+A esas tres se sumó una cuarta durante el desarrollo: **corregir el control que hizo viable el ataque y medir el efecto de la corrección sobre el mismo ataque**, que es lo que documenta la [fase 2](#fase-2-remediación-y-verificación).
 
 ---
 
@@ -192,36 +196,39 @@ tail -f /var/ossec/logs/alerts/alerts.json
 El fichero de alertas en bruto es prácticamente ilegible: cada evento ocupa decenas de líneas de JSON. Para el trabajo de análisis se usó un filtrado con `jq` que reduce cada alerta a una sola línea con los campos relevantes:
 
 ```bash
-jq -r '"\(.timestamp) | nivel \(.rule.level) | \(.rule.id) | \(.rule.description)"' \
+jq -r '"\(.data.win.system.systemTime) | nivel \(.rule.level) | \(.rule.id) | \(.rule.description)"' \
   /var/ossec/logs/alerts/alerts.json | tail -40
 ```
 
 ![Cronología de alertas filtrada con jq](screenshots/11-timeline-alertas.png)
 
+> **Sobre el campo de tiempo.** El campo `timestamp` de una alerta de Wazuh es el momento en que **el manager la procesó**, no el momento en que el evento ocurrió en el endpoint. En este laboratorio el desfase de ingesta osciló entre 15 y 45 segundos. Para reconstruir cronologías se usa `data.win.system.systemTime`, que es la hora del propio evento. **Salvo en las citas literales de log y en las capturas del dashboard, todas las horas de este documento son horas de evento en UTC.**
+
 ### Cronología del incidente
 
 ```
-19:31:53  nivel 5   60122  Logon Failure - Unknown user or bad password   ← intentos manuales (tipo 2)
-19:31:58  nivel 5   60122  Logon Failure
-19:32:01  nivel 5   60122  Logon Failure
-19:39:11  nivel 5   60122  Logon Failure                                  ← segunda tanda manual
-19:39:15  nivel 5   60122  Logon Failure
-19:39:20  nivel 5   60122  Logon Failure
-19:39:55  nivel 5   60122  Logon Failure
-19:43:44  nivel 5   60122  Logon Failure
-19:44:28  nivel 3   60118  Windows Workstation Logon Success              ← inicio de sesión correcto
-19:44:28  nivel 3   67028  Special privileges assigned to new logon
-19:45:57  nivel 5   60122  Logon Failure                                  ← ráfaga automatizada (tipo 3)
-19:46:00  nivel 5   60122  Logon Failure
-19:46:02  nivel 5   60122  Logon Failure
-19:46:04  nivel 5   60122  Logon Failure
-19:46:06  nivel 5   60122  Logon Failure
-19:46:08  nivel 5   60122  Logon Failure
-19:46:10  nivel 10  60204  Multiple Windows Logon Failures                ← CORRELACIÓN
-19:46:12  nivel 5   60122  Logon Failure
+19:31:11  4625   Logon Failure   tipo 2   ← intentos manuales
+19:31:18  4625   Logon Failure   tipo 2
+19:31:22  4625   Logon Failure   tipo 2
+19:39:12  4625   Logon Failure   tipo 2   ← segunda tanda manual
+19:39:15  4625   Logon Failure   tipo 2
+19:39:18  4625   Logon Failure   tipo 2
+19:39:40  4625   Logon Failure   tipo 2
+19:42:40  4625   Logon Failure   tipo 2
+19:43:40  4624   Logon Success            ← inicio de sesión correcto (×2)
+19:43:40  4672   Special privileges assigned to new logon
+19:45:42  4625   Logon Failure   tipo 3   ← ráfaga automatizada
+19:45:44  4625   Logon Failure   tipo 3
+19:45:46  4625   Logon Failure   tipo 3
+19:45:48  4625   Logon Failure   tipo 3
+19:45:50  4625   Logon Failure   tipo 3
+19:45:52  4625   Logon Failure   tipo 3
+19:45:54  4625   Logon Failure   tipo 3
+19:45:55  4625   Logon Failure   tipo 3   → dispara 60204, nivel 10, CORRELACIÓN
+19:56:13  4625   Logon Failure   tipo 3
 ```
 
-**Observación clave:** los intentos espaciados no dispararon ninguna alerta agregada. La regla de correlación `60204` exige una **frecuencia de 8 eventos dentro de una ventana temporal**; los intentos manuales, separados por más de 30 segundos, caducaban antes de alcanzar el umbral. Solo la ráfaga automatizada —8 eventos en 11 segundos— activó la detección.
+**Observación clave:** los intentos espaciados no dispararon ninguna alerta agregada. La regla de correlación `60204` exige una **frecuencia de 8 eventos dentro de una ventana temporal**, y las dos tandas manuales nunca acumularon ocho dentro de esa ventana. Solo la ráfaga automatizada —ocho eventos en trece segundos— activó la detección.
 
 ### Evidencia
 
@@ -229,7 +236,6 @@ Extracto de un evento 4625 individual, recortado a los campos relevantes:
 
 ```json
 {
-  "timestamp": "2026-09-12T19:45:57.972+0000",
   "rule": { "level": 5, "id": "60122", "description": "Logon Failure - Unknown user or bad password" },
   "agent": { "id": "001", "name": "win10-ws01", "ip": "192.168.10.246" },
   "data": { "win": { "eventdata": {
@@ -250,7 +256,6 @@ Alerta de correlación resultante:
 
 ```json
 {
-  "timestamp": "2026-09-12T19:46:10.704+0000",
   "rule": {
     "level": 10,
     "id": "60204",
@@ -273,14 +278,14 @@ El campo `previous_output` de esta alerta contiene los ocho eventos que la dispa
 | `ipAddress` | `127.0.0.1` | Origen local. La autenticación llegó por SMB pero desde la propia máquina: apunta a un proceso local, no a un atacante remoto |
 | `ipPort` | `49822`, `49824`, `49826`… | Puertos efímeros distintos por intento en los eventos de red. En los interactivos es siempre `0`, al no existir conexión de red |
 | `authenticationPackageName` | `NTLM` / `Negotiate` | NTLM en los de red (`NtLmSsp`), Negotiate en los interactivos (`User32`) |
-| Cadencia | 8 intentos en 11 s (~1,3/s) | **Ningún humano teclea a esa velocidad.** Solo el ritmo ya permite afirmar que hubo herramienta automatizada |
+| Cadencia | 8 intentos en 13 s, uno cada ~2 s exactos | **Ningún humano teclea con esa regularidad.** Los intentos manuales, en cambio, se separan por huecos irregulares de entre 3 y 470 segundos. El patrón temporal por sí solo separa humano de automatización |
 
 ### Triaje de la alerta (metodología de las 5 W)
 
 | | |
 |---|---|
 | **What** | 8 intentos fallidos de autenticación (Event ID 4625) contra la cuenta local `user`, que dispararon la regla 60204 *Multiple Windows Logon Failures* con severidad 10 |
-| **When** | 12/09/2026, entre 19:45:57 y 19:46:08 UTC. La alerta de correlación se genera a las 19:46:10 UTC |
+| **When** | 12/09/2026, entre 19:45:42 y 19:45:55 UTC (horas de evento) |
 | **Where** | Endpoint `win10-ws01` (192.168.10.246), nombre de equipo Windows `DESKTOP-5TK7R4T` |
 | **Who** | Cuenta objetivo `user`, local del equipo. Origen `127.0.0.1` — la autenticación se inició desde la propia máquina, no desde la red externa |
 | **Why** | Actividad generada de forma controlada en el laboratorio para validar la capacidad de detección. En un entorno real, este patrón exigiría identificar qué proceso local originó las autenticaciones |
@@ -301,10 +306,10 @@ Al tratarse de un laboratorio controlado, la alerta se cierra como actividad pro
 
 1. **Verificar si algún intento tuvo éxito**, buscando eventos 4624 de la misma cuenta inmediatamente posteriores. Es la pregunta que determina si esto es un intento fallido o una intrusión consumada.
 2. **Identificar el proceso de origen**, dado que la autenticación provino de `127.0.0.1`: un ataque local implica que el adversario ya dispone de ejecución en el equipo.
-3. **Revisar la política de bloqueo de cuentas.** En este caso, la auditoría CIS confirmó que **no está configurada** (controles 15506, 15507 y 15508), lo que explica que el ataque pudiera completarse sin bloqueo alguno.
+3. **Revisar la política de bloqueo de cuentas.** La auditoría CIS la marcó como no conforme (controles 15506, 15507 y 15508). El porqué de que no llegara a activarse durante el ataque se analiza en la [fase 2](#fase-2-remediación-y-verificación), y no es el que parecía a primera vista.
 4. **Escalar a L2** si se confirmara acceso exitoso o si no pudiera justificar el proceso de origen.
 
-**Mitigaciones recomendadas:** política de bloqueo de cuentas, autenticación multifactor donde sea viable, y restricción de NTLM en favor de Kerberos en entornos de dominio.
+**Mitigaciones recomendadas:** política de bloqueo de cuentas conforme al benchmark, autenticación multifactor donde sea viable, y restricción de NTLM en favor de Kerberos en entornos de dominio.
 
 ---
 
@@ -324,7 +329,7 @@ Wazuh ejecutó de forma automática un **SCA (Security Configuration Assessment)
 
 De un total de **424 controles evaluados**, el endpoint **incumple 311** y solo supera 108 (5 no aplicables), lo que sitúa la puntuación en un **25 %**.
 
-Entre los controles fallidos hay tres directamente relevantes para el incidente analizado en este laboratorio:
+Entre los controles fallidos hay tres directamente relevantes para el incidente analizado:
 
 | ID | Control | Resultado |
 |---|---|---|
@@ -332,25 +337,27 @@ Entre los controles fallidos hay tres directamente relevantes para el incidente 
 | 15507 | *Ensure 'Account lockout threshold' is set to '5 or fewer invalid logon attempt(s), but not 0'* | **Failed** |
 | 15508 | *Ensure 'Reset account lockout counter after' is set to '15 or more minute(s)'* | **Failed** |
 
-**La política de bloqueo de cuentas no está configurada en el endpoint.** Este hallazgo explica por qué el ataque de fuerza bruta documentado en el apartado anterior pudo ejecutar dieciséis intentos consecutivos sin que la cuenta `user` llegara a bloquearse en ningún momento: no existe umbral que lo impida.
+El valor real de esos tres parámetros en el endpoint era **10 intentos, 10 minutos de bloqueo y 10 minutos de ventana**: los que Windows aplica por defecto. La política existe; lo que no cumple es el estándar, que exige un umbral de 5 o menos y tiempos de 15 minutos o más.
 
-La correlación entre ambos hallazgos es el resultado más relevante del laboratorio. El SIEM detectó el ataque, pero **la auditoría de configuración identificó el control ausente que lo hizo viable**. Detección y postura de seguridad son dos caras del mismo problema: sin el control preventivo, la detección llega siempre tarde.
+La distinción importa, y me costó una hipótesis equivocada darme cuenta: *no conforme* no es lo mismo que *ausente*, y la diferencia cambia por completo el análisis de por qué el ataque prosperó. El desarrollo está en la [fase 2](#fase-2-remediación-y-verificación).
 
-A la misma conclusión apuntan otros controles fallidos del bloque de contraseñas: longitud mínima (15503), historial de contraseñas (15500) y antigüedad mínima (15502), todos ellos sin configurar. También falla *Turn on PowerShell Transcription*, un control de visibilidad relevante para la detección de actividad sospechosa.
+A los mismos valores por defecto apuntan otros controles fallidos del bloque de contraseñas: longitud mínima (15503), historial (15500) y antigüedad mínima (15502). También falla *Turn on PowerShell Transcription*, un control de visibilidad relevante para la detección.
 
-Este hallazgo demuestra además una segunda capacidad de la plataforma más allá de la detección: **evaluación continua de cumplimiento y postura de seguridad**, con una métrica cuantificable que sirve de línea base para medir mejoras de hardening.
+Este hallazgo demuestra una segunda capacidad de la plataforma más allá de la detección: **evaluación continua de cumplimiento y postura de seguridad**, con una métrica cuantificable que sirve de línea base para medir mejoras de hardening.
 
 ### 2. Inicio de sesión exitoso con privilegios especiales
 
-La cronología recoge, entre dos tandas de intentos fallidos, la siguiente secuencia:
+La cronología recoge, entre las dos tandas de intentos fallidos, la siguiente secuencia:
 
 ```
-19:43:44  nivel 5  60122  Logon Failure
-19:44:28  nivel 3  60118  Windows Workstation Logon Success
-19:44:28  nivel 3  67028  Special privileges assigned to new logon
+19:42:40  4625  Logon Failure
+19:43:40  4624  Logon Success
+19:43:40  4672  Special privileges assigned to new logon
 ```
 
-Un fallo de autenticación seguido, 44 segundos después, de un inicio de sesión correcto con **asignación de privilegios especiales** (Event ID 4672, cuenta con permisos administrativos). En este laboratorio corresponde a un acceso legítimo propio, pero **la firma es idéntica a la de una credencial comprometida con escalada de privilegios**, y en un entorno real justificaría escalado inmediato.
+Un fallo de autenticación seguido, sesenta segundos después, de un inicio de sesión correcto con **asignación de privilegios especiales** (Event ID 4672, cuenta con permisos administrativos). En este laboratorio corresponde a un acceso legítimo propio, pero **la firma es idéntica a la de una credencial comprometida con escalada de privilegios**, y en un entorno real justificaría escalado inmediato.
+
+Este hallazgo parecía independiente del anterior. No lo es: resultó ser la pieza que explica por qué el bloqueo de cuentas nunca se activó.
 
 ### 3. Creación de un servicio en Windows — descartado
 
@@ -370,6 +377,207 @@ Corresponde al **controlador de análisis en modo kernel de Microsoft Defender**
 
 ---
 
+## Fase 2: remediación y verificación
+
+El hallazgo del SCA dejaba una pregunta abierta: si la política de bloqueo existe con un umbral de 10 y el ataque acumuló diecisiete intentos fallidos, ¿por qué la cuenta `user` no se bloqueó en ningún momento?
+
+Esta fase responde a esa pregunta, corrige la configuración y **mide el efecto de la corrección sobre el mismo ataque**.
+
+### Punto de partida
+
+```
+Umbral de bloqueo:                                10
+Duración de bloqueo (minutos):                    10
+Ventana de obs. de bloqueo (minutos):             10
+Longitud mínima de contraseña:                    0
+Duración del historial de contraseñas:            Ninguna
+Duración mín. de contraseña (días):               0
+```
+
+### Hipótesis descartadas
+
+**Hipótesis 1: no existía política de bloqueo.** Falsa. La salida de `net accounts` la desmiente.
+
+**Hipótesis 2: la cuenta sí se bloqueó y no lo vimos.** Es la hipótesis peligrosa, porque la conclusión original —*"no se bloqueó"*— se había deducido de no haber visto ninguna alerta, sin comprobar antes si ese evento estaba siquiera siendo auditado. Descartarla exige dos comprobaciones, en este orden:
+
+```cmd
+auditpol /get /subcategory:"{0CCE9235-69AE-11D9-BED3-505054503030}"
+```
+
+```
+Administración de cuentas
+  Administración de cuentas de usuario    Aciertos
+```
+
+La auditoría está activa. Conviene señalar que el evento **4740** se registra bajo *Administración de cuentas de usuario*, **no** bajo la subcategoría llamada *Bloqueo de cuenta* de Inicio/cierre de sesión, que es la que el nombre sugiere. Se consultan por GUID porque los nombres cambian con el idioma del sistema.
+
+Con la auditoría confirmada, la ausencia de eventos sí significa algo:
+
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4740}
+Get-WinEvent : No se encontraron eventos que coincidan con los criterios de selección especificados
+```
+
+Y los diecisiete eventos 4625 del incidente tienen todos `subStatus: 0xc000006a` (contraseña incorrecta); ninguno `0xc0000234` (cuenta bloqueada). **La cuenta nunca se bloqueó, y ahora está verificado en lugar de supuesto.**
+
+### La causa: un inicio de sesión correcto reinicia el contador
+
+| Tramo | Eventos | `badPwdCount` |
+|---|---|---|
+| 19:31:11 → 19:42:40 | 8 × 4625 (tipo 2) | llega a **8** |
+| **19:43:40** | **4624 — inicio de sesión correcto** | **reset a 0** |
+| 19:45:42 → 19:45:55 | 8 × 4625 (tipo 3) | llega a **8** |
+| 19:56:13 | 1 × 4625 | han pasado 10 min 18 s desde el anterior: la ventana de observación caduca y el contador vuelve a cero |
+
+**Un inicio de sesión correcto pone `badPwdCount` a cero.** El acceso legítimo de las 19:43:40 —el mismo que el apartado anterior documenta como hallazgo aparentemente independiente— partió el ataque en dos mitades de ocho intentos cada una. El contador nunca superó **8**, con el umbral situado en **10**.
+
+Los dos hallazgos no eran dos: el inicio de sesión correcto en mitad del ataque es lo que impidió que el control preventivo llegara a actuar. En un ataque real el mecanismo es idéntico, y es la razón por la que los umbrales altos son peligrosos: **quien consigue autenticarse una sola vez en mitad de un *password spraying* se recarga el presupuesto entero de intentos.**
+
+### Verificación con experimento controlado
+
+Antes de cambiar nada, comprobé que la política funcionaba lanzando doce intentos seguidos y leyendo el contador en cada iteración:
+
+```powershell
+1..12 | ForEach-Object {
+  net use \\127.0.0.1\IPC$ /user:"$env:COMPUTERNAME\user" "MalaPass$_" 2>$null | Out-Null
+  $u = [ADSI]"WinNT://./user,user"
+  "intento $_ -> badPwdCount = $($u.BadPasswordAttempts)"
+}
+```
+
+```
+intento  9 -> badPwdCount = 9
+intento 10 -> badPwdCount = 10
+intento 11 -> badPwdCount = 10
+intento 12 -> badPwdCount = 10
+```
+
+El contador se congela en 10 y se genera el evento 4740. La política funcionaba correctamente: **lo que falló el 12/09 no fue el control, sino que el ataque nunca llegó a alcanzarlo.**
+
+### Remediación
+
+Seis controles CIS corregidos:
+
+```cmd
+net accounts /lockoutthreshold:5
+net accounts /lockoutduration:15
+net accounts /lockoutwindow:15
+net accounts /minpwlen:14
+net accounts /uniquepw:24
+net accounts /minpwage:1
+```
+
+```
+Umbral de bloqueo:                                5
+Duración de bloqueo (minutos):                    15
+Ventana de obs. de bloqueo (minutos):             15
+Longitud mínima de contraseña:                    14
+Duración del historial de contraseñas:            24
+Duración mín. de contraseña (días):               1
+```
+
+### Mismo ataque, umbral conforme
+
+Se repitió la ráfaga automatizada de ocho intentos, idéntica a la del 12/09:
+
+```
+intento 1 -> badPwdCount = 1 | bloqueada = False
+intento 2 -> badPwdCount = 2 | bloqueada = False
+intento 3 -> badPwdCount = 3 | bloqueada = False
+intento 4 -> badPwdCount = 4 | bloqueada = False
+intento 5 -> badPwdCount = 5 | bloqueada = True
+intento 6 -> badPwdCount = 5 | bloqueada = True
+intento 7 -> badPwdCount = 5 | bloqueada = True
+intento 8 -> badPwdCount = 5 | bloqueada = True
+```
+
+Y lo que llegó al SIEM:
+
+![Alerta de bloqueo de cuenta en el dashboard de Wazuh](screenshots/13-alerta-4740.png)
+
+> La captura muestra las horas tal y como las presenta el dashboard: hora **local** (UTC+2) y campo `timestamp`, es decir, momento de ingesta. Los valores del bloque siguiente son horas de evento en UTC, tomadas de `systemTime`. Entre unas y otras hay unos cuarenta segundos de desfase de ingesta.
+
+```
+15:45:05.1459  4625  60122  nivel 5
+15:45:07.5397  4625  60122  nivel 5
+15:45:09.8990  4625  60122  nivel 5
+15:45:12.2558  4625  60122  nivel 5
+15:45:14.7999  4740  60115  nivel 9   ← User account locked out
+15:45:14.8000  4625  60122  nivel 5
+```
+
+| | 12/09 — umbral 10 | 20/09 — umbral 5 |
+|---|---|---|
+| Intentos lanzados | 8 | 8 |
+| Eventos 4625 recibidos por el SIEM | 8 | **5** |
+| `badPwdCount` máximo alcanzado | 8 | 5 |
+| Cuenta bloqueada | **No** | **Sí, en el quinto intento** |
+| Evento 4740 | No | Sí — regla 60115, nivel 9 |
+| Correlación 60204 (nivel 10) | **Sí** | **No** |
+| Intentos sin telemetría | 0 | **3** |
+
+### Hallazgo principal: endurecer el endpoint apagó la alerta
+
+Comparando las horas de las dos pruebas realizadas el mismo día, la primera con el umbral aún en 10 y la segunda ya con 5:
+
+```
+14:55:06  60204  nivel 10   detección   (umbral 10)
+14:55:10  60115  nivel  9   bloqueo, 4 s después
+15:45:14  60115  nivel  9   bloqueo     (umbral 5)
+                            60204 no aparece
+```
+
+Con el umbral en 10 la regla de correlación salta al octavo fallo y el bloqueo llega al décimo: **detección primero, prevención después**. El analista recibe una alerta de nivel 10 que nombra explícitamente el ataque y lo mapea a T1110.
+
+Con el umbral en 5 el bloqueo corta en el quinto intento. Solo cinco eventos alcanzan el SIEM, y la regla 60204 exige ocho dentro de su ventana: **nunca llega a dispararse.**
+
+Al llevar el control preventivo a conformidad CIS, **la señal de detección más explícita que existía desapareció.** Sigue habiendo cobertura —el 60115 de nivel 9 sí salta— pero la regla que identifica el ataque por su nombre y aplica el mapeo MITRE correcto ya no se activa. Si el playbook de un SOC se apoyara en la 60204, después de endurecer el parque esa regla sería código muerto.
+
+**Conclusión de ingeniería de detección:** el umbral de frecuencia de la regla de correlación debe quedar **por debajo** del umbral de bloqueo del endpoint. Con bloqueo a 5 intentos, la correlación tiene que disparar a 3 o 4, no a 8. De lo contrario prevención y detección se estorban en lugar de complementarse.
+
+### La regla del bloqueo y su doble mapeo
+
+```
+60115 | nivel 9 | User account locked out (multiple login errors) | T1110, T1531
+```
+
+El doble mapeo no es un error del conjunto de reglas: es una ambigüedad real del evento. Un 4740 aislado no distingue entre un bloqueo **colateral** de un ataque de fuerza bruta (T1110, *Credential Access*) y un bloqueo **deliberado** para denegar el acceso a los usuarios (T1531, *Impact*). Lo resuelve el contexto: si viene precedido de un patrón de adivinación de contraseñas, es lo primero; si se bloquean decenas de cuentas sin fallos previos que lo justifiquen, es lo segundo. Esa desambiguación es trabajo del analista, no de la herramienta.
+
+Detalle discutible: el bloqueo puntúa **nivel 9**, por debajo del nivel 10 de la correlación de fallos, cuando el bloqueo es un impacto confirmado y la correlación solo una sospecha.
+
+### Punto ciego: el atacante desaparece tras el bloqueo
+
+De los ocho intentos lanzados solo cinco generaron evento. Los intentos 6, 7 y 8 **no existen en ningún registro** — ni en Wazuh ni en el visor de eventos de Windows. El mismo comportamiento se observó en la prueba de doce intentos: diez eventos registrados, los dos últimos sin rastro.
+
+Una vez bloqueada la cuenta, Windows rechaza la autenticación **antes** de evaluar la contraseña, y no emite 4625. Dos detalles adicionales, verificados en las dos pruebas: el **4740 se emite antes que el 4625 que lo provoca** —0,14 ms en una prueba, 14,6 ms en la otra—, y ese último 4625 sigue llevando `subStatus 0xc000006a`. El subestado `0xc0000234` (cuenta bloqueada) **nunca llega a aparecer** en ningún evento.
+
+La implicación operativa: tras activarse el bloqueo, el atacante puede seguir intentándolo indefinidamente sin generar un solo evento. **El control preventivo protege y ciega al mismo tiempo.** Un SOC que mida la intensidad de un ataque por volumen de eventos la subestimará sistemáticamente en los endpoints endurecidos.
+
+### Ruido recurrente: candidato a tuning
+
+Durante la fase 2 se registraron **nueve alertas `61104 Service startup type was changed` en veintiséis minutos**:
+
+```
+BITS              inicio automático ↔ inicio por solicitud
+TrustedInstaller  inicio por solicitud → inicio automático
+```
+
+Es la maquinaria de Windows Update: BITS alterna su tipo de arranque según encola y termina descargas, y TrustedInstaller hace lo propio durante el servicing. Falso positivo legítimo, pero **recurrente e indefinido**, y por tanto candidato claro a supresión o rebaja de nivel. Ensucia la cronología de forma continua sin aportar valor de seguridad, que es la definición práctica de la fatiga de alertas.
+
+### Efecto sobre la puntuación CIS
+
+![SCA tras la remediación](screenshots/14-sca-despues.png)
+
+```
+Passed: 114   Failed: 305   Not applicable: 5   Score: 27 %
+```
+
+Los seis controles pasaron de *Failed* a *Passed*, y la puntuación subió del **25 % al 27 %**. Los números cuadran exactamente —de 108 a 114 controles superados sobre 419 evaluables— lo que confirma que la variación es atribuible solo a la remediación y no a ruido de medición.
+
+Dos puntos porcentuales por arreglar precisamente los controles que causaban el incidente. Es un resultado modesto y conviene decirlo tal cual: **el hardening es incremental y la puntuación CIS es una línea base, no un objetivo.** Quedan 305 controles incumplidos.
+
+---
+
 ## Problemas encontrados
 
 | Problema | Causa | Solución |
@@ -378,7 +586,9 @@ Corresponde al **controlador de análisis en modo kernel de Microsoft Defender**
 | Reinstalación abortada con `Wazuh manager already installed` | El rollback del primer intento eliminó los ficheros de `/var/ossec` pero dejó el paquete registrado en dpkg | Relanzar con la opción `-o/--overwrite` |
 | `dpkg --purge` falla con *pre-removal script subprocess returned error exit status 127*, paquete atascado en estado `pi` | Dependencia circular: el script `prerm` del paquete invoca binarios de `/var/ossec/bin` que ya habían sido eliminados. Código 127 = orden no encontrada | Neutralizar los scripts de mantenimiento sustituyéndolos por un `exit 0` en `/var/lib/dpkg/info/wazuh-manager.{prerm,postrm}` y purgar de nuevo. La instalación posterior completó sin errores |
 | La VM Windows no resuelve nombres: *No se puede resolver el nombre remoto: packages.wazuh.com* | Configuración de red del adaptador virtual | Revisar el modo de red del adaptador y la configuración DNS del endpoint |
-| La regla de correlación de fuerza bruta no se dispara pese a acumular múltiples fallos | Los intentos manuales estaban demasiado espaciados (>30 s) y caducaban de la ventana temporal antes de alcanzar el umbral de frecuencia | Automatizar la generación para concentrar 8 intentos en pocos segundos |
+| La regla de correlación de fuerza bruta no se dispara pese a acumular múltiples fallos | Los intentos manuales estaban demasiado espaciados y caducaban de la ventana temporal antes de alcanzar el umbral de frecuencia | Automatizar la generación para concentrar 8 intentos en pocos segundos |
+| `net accounts /lockoutwindow:15` devuelve *Error de sistema 87 — El parámetro no es correcto* | La ventana de observación no puede ser mayor que la duración del bloqueo, que en ese momento seguía en 10 minutos | Aplicar los parámetros en orden: umbral, después duración, después ventana |
+| Las alertas del incidente no aparecen al consultar `alerts.json` días después | Wazuh rota el fichero cada noche a `/var/ossec/logs/alerts/AÑO/MES/`; `alerts.json` solo contiene el día en curso | Consultar los ficheros rotados. En este despliegue no están comprimidos, por lo que `cat` basta y `zcat` falla en silencio |
 
 Salida real del primer despliegue fallido:
 
@@ -403,31 +613,34 @@ Errors were encountered while processing:
 pi  wazuh-manager   4.14.7-1   amd64   Wazuh manager
 ```
 
-**Incidencia documentada pero no resuelta:** durante el primer despliegue se registraron bloqueos del kernel en la VM del servidor (`rcu_preempt detected stalls on CPUs/tasks`, con aviso de que *OOM is now expected behavior*). Se corresponden con la ejecución de VirtualBox sobre Hyper-V en el anfitrión, que degrada el acceso directo a la virtualización por hardware. No se modificó la configuración del sistema anfitrión, y el despliegue completó correctamente una vez resueltos los problemas de disco y de paquetería, por lo que no resultó bloqueante.
+**Incidencia documentada pero no resuelta:** durante el primer despliegue se registraron bloqueos del kernel en la VM del servidor (`rcu_preempt detected stalls on CPUs/tasks`, con aviso de que *OOM is now expected behavior*). La hipótesis más probable es la ejecución de VirtualBox sobre un anfitrión con Hyper-V activo, que degrada el acceso directo a la virtualización por hardware, pero **no llegué a verificarla**: no se modificó la configuración del anfitrión y el despliegue completó correctamente una vez resueltos los problemas de disco y de paquetería, por lo que no resultó bloqueante. Queda anotada como hipótesis, no como causa confirmada.
 
 ---
 
 ## Conclusiones
 
-El laboratorio cubre un ciclo completo de operación SOC de nivel 1: despliegue de la plataforma, incorporación de un endpoint, generación controlada de actividad maliciosa, detección, triaje estructurado y propuesta de mitigación.
+El laboratorio cubre un ciclo completo de operación SOC de nivel 1: despliegue de la plataforma, incorporación de un endpoint, generación controlada de actividad maliciosa, detección, triaje estructurado, remediación del control deficiente y verificación medida del resultado.
 
-Más allá del despliegue, el ejercicio deja cuatro aprendizajes concretos:
+Los aprendizajes que me llevo, por orden de lo que más me costó:
 
-- **La correlación es lo que convierte eventos en detecciones.** Ocho fallos de autenticación aislados de severidad 5 generan una única alerta de severidad 10 que sí identifica la técnica. Sin ventana temporal ni umbral de frecuencia, solo hay ruido.
-- **Detectar no es lo mismo que estar protegido.** El SIEM identificó el ataque, pero la auditoría de configuración reveló que la ausencia de política de bloqueo de cuentas era precisamente lo que lo hacía viable. La detección sin control preventivo llega siempre tarde.
-- **Los mapeos por defecto de una herramienta se revisan, no se asumen.** La regla individual clasificaba la actividad bajo una técnica MITRE que no correspondía al comportamiento observado.
+- **Una conclusión sin evidencia es una suposición, aunque acierte.** La primera versión de este informe afirmaba que el endpoint no tenía política de bloqueo y que por eso la cuenta nunca se bloqueó. Lo segundo era cierto; lo primero, falso; y ninguna de las dos cosas estaba verificada. **No ver una alerta no significa que no ocurriera: significa que no se estaba mirando.** Antes de concluir que un evento no se produjo hay que comprobar que ese evento estaba siendo auditado.
+- **Prevención y detección no se suman automáticamente: pueden estorbarse.** Endurecer el control de bloqueo eliminó la alerta de correlación de mayor severidad que el SIEM generaba para este ataque. La conclusión operativa es que el umbral de la regla debe quedar por debajo del umbral del control, y que tras cualquier campaña de hardening hay que revisar qué detecciones han dejado de dispararse.
+- **La correlación es lo que convierte eventos en detecciones.** Ocho fallos aislados de severidad 5 producen una única alerta de severidad 10 que sí identifica la técnica. Sin ventana temporal ni umbral de frecuencia, solo hay ruido.
+- **Los mapeos por defecto se revisan, no se asumen.** La regla individual clasificaba la actividad bajo una técnica MITRE que no correspondía al comportamiento observado, y la regla de bloqueo arrastra dos técnicas contradictorias que solo el contexto puede desambiguar.
+- **La hora del evento no es la hora de la alerta.** Reconstruir una cronología con el `timestamp` de ingesta en lugar del `systemTime` del evento introduce desfases de hasta cuarenta segundos, suficientes para invertir el orden de dos hechos y romper un razonamiento entero.
 - **Los problemas de despliegue son parte del trabajo.** Resolver un paquete atascado en dpkg por una dependencia circular en sus scripts de mantenimiento tiene tanto valor formativo como la detección en sí.
 
 ---
 
 ## Evolución del laboratorio
 
-Este laboratorio está planteado como base sobre la que iterar. La siguiente fase se centra en cerrar la brecha que la propia investigación puso de manifiesto:
+Este laboratorio está planteado como base sobre la que iterar. Las siguientes líneas salen directamente de lo que la fase 2 dejó abierto:
 
-- **Configurar la política de bloqueo de cuentas** y repetir el ataque, verificando que la cuenta se bloquea antes de alcanzar el umbral de correlación. Es la validación directa del hallazgo del SCA.
+- **Escribir una regla de correlación propia** con umbral de frecuencia por debajo del umbral de bloqueo (3 o 4 fallos), mapeo MITRE corregido, y validar que se dispara donde la 60204 ya no llega.
+- **Suprimir o rebajar la regla 61104** para el caso de BITS y TrustedInstaller, midiendo la reducción de ruido en la cronología.
 - **Integrar Sysmon** en el endpoint para ampliar la visibilidad sobre creación de procesos y conexiones de red, más allá de lo que registra el canal de seguridad de Windows por defecto.
-- **Desarrollar una regla de detección propia** con el mapeo MITRE corregido, en lugar de depender del conjunto de reglas por defecto.
 - **Configurar Active Response** para pasar de la detección a la contención automática del origen tras N fallos de autenticación.
+- **Continuar la remediación CIS** por bloques, midiendo la puntuación tras cada uno, para construir una curva de hardening en lugar de un dato aislado.
 
 ---
 
@@ -435,6 +648,8 @@ Este laboratorio está planteado como base sobre la que iterar. La siguiente fas
 
 - [Documentación oficial de Wazuh](https://documentation.wazuh.com/current/)
 - [MITRE ATT&CK — T1110 Brute Force](https://attack.mitre.org/techniques/T1110/)
+- [MITRE ATT&CK — T1531 Account Access Removal](https://attack.mitre.org/techniques/T1531/)
 - [Microsoft — Event ID 4625: Error de inicio de sesión](https://learn.microsoft.com/windows/security/threat-protection/auditing/event-4625)
 - [Microsoft — Event ID 4672: Privilegios especiales asignados](https://learn.microsoft.com/windows/security/threat-protection/auditing/event-4672)
+- [Microsoft — Event ID 4740: Cuenta de usuario bloqueada](https://learn.microsoft.com/windows/security/threat-protection/auditing/event-4740)
 - [CIS Microsoft Windows 10 Benchmark](https://www.cisecurity.org/benchmark/microsoft_windows_desktop)
